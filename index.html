@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>水解衛生棉沖水模擬器 - 設計師工具</title>
+    <style>
+        :root {
+            --primary: #2c3e50;
+            --accent: #3498db;
+            --bg: #f4f7f6;
+        }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); margin: 0; display: flex; height: 100vh; }
+        
+        /* 控制面板 */
+        #sidebar {
+            width: 350px; background: white; padding: 25px; box-shadow: 2px 0 10px rgba(0,0,0,0.1);
+            display: flex; flex-direction: column; gap: 20px; overflow-y: auto;
+        }
+        h2 { color: var(--primary); margin-top: 0; font-size: 1.2rem; border-bottom: 2px solid var(--accent); padding-bottom: 10px; }
+        .control-group { display: flex; flex-direction: column; gap: 8px; }
+        label { font-size: 0.9rem; font-weight: bold; color: #666; display: flex; justify-content: space-between; }
+        label span { color: var(--accent); }
+        input[type=range] { width: 100%; cursor: pointer; }
+        
+        /* 視覺化區域 */
+        #main { flex-grow: 1; position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #e0f2f1; overflow: hidden; }
+        canvas { background: white; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,0.15); max-width: 90%; }
+        
+        .stats {
+            position: absolute; bottom: 20px; left: 20px; background: rgba(255,255,255,0.8);
+            padding: 15px; border-radius: 8px; font-size: 0.85rem; pointer-events: none;
+            min-width: 250px;
+        }
+        .integrity-bar {
+            width: 100%; height: 10px; background: #ddd; border-radius: 5px; margin-top: 5px;
+        }
+        .integrity-fill {
+            height: 100%; background: linear-gradient(to right, #e74c3c, #f39c12, #27ae60); border-radius: 5px; transition: width 0.3s;
+        }
+        .btn-flush {
+            background: var(--accent); color: white; border: none; padding: 12px; border-radius: 5px;
+            font-weight: bold; cursor: pointer; transition: 0.3s;
+        }
+        .btn-flush:hover { background: #2980b9; }
+        .formula { font-size: 0.8rem; color: #7f8c8d; font-style: italic; background: #eee; padding: 10px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+
+<div id="sidebar">
+    <h2>參數設定 (Parameters)</h2>
+    
+    <div class="control-group">
+        <label>衛生棉長度 (Length) <span id="val-len">240</span>mm</label>
+        <input type="range" id="len" min="150" max="420" value="240">
+    </div>
+
+    <div class="control-group">
+        <label>材料厚度 (Thickness) <span id="val-thick">2.0</span>mm</label>
+        <input type="range" id="thick" min="0.5" max="5.0" step="0.1" value="2.0">
+    </div>
+
+    <div class="control-group">
+        <label>纖維結合強度 (Bonding) <span id="val-bond">50</span>%</label>
+        <input type="range" id="bond" min="10" max="100" value="50">
+    </div>
+
+    <div class="control-group">
+        <label>馬桶沖水流速 (Flow) <span id="val-flow">2.5</span>m/s</label>
+        <input type="range" id="flow" min="0.5" max="5.0" step="0.1" value="2.5">
+    </div>
+
+    <button class="btn-flush" onclick="startFlush()">模擬沖水 (FLUSH)</button>
+    <button class="btn-flush" onclick="resetSimulation()" style="background: #e74c3c;">重置 (RESET)</button>
+
+    <div class="formula">
+        <strong>運算邏輯：</strong><br>
+        1. 阻力(R) = 厚度 × 結合強度<br>
+        2. 剪切力(S) = (流速² × 長度) / 1000<br>
+        3. 當 S > R，結構開始解體
+    </div>
+</div>
+
+<div id="main">
+    <canvas id="canvas"></canvas>
+    <div class="stats" id="stats">
+        狀態: 等待沖水...<br>
+        當前結構完整度: 100%<br>
+        <div class="integrity-bar"><div class="integrity-fill" id="integrity-fill" style="width: 100%;"></div></div>
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const stats = document.getElementById('stats');
+
+    // 初始化畫布大小
+    canvas.width = 800;
+    canvas.height = 400;
+
+    let particles = [];
+    let isFlushing = false;
+    let integrity = 100;
+
+    // 滑桿交互
+    const inputs = ['len', 'thick', 'bond', 'flow'];
+    inputs.forEach(id => {
+        document.getElementById(id).oninput = function() {
+            document.getElementById(`val-${id}`).innerText = this.value;
+            // 如果沒有在沖水，才重新初始化；沖水中只更新參數
+            if (!isFlushing) {
+                initPad();
+            }
+        };
+    });
+
+    // 粒子類：代表衛生棉的小纖維塊
+    class Fiber {
+        constructor(x, y, isFixed) {
+            this.originX = x;
+            this.originY = y;
+            this.x = x;
+            this.y = y;
+            this.vx = 0;
+            this.vy = 0;
+            this.isFixed = isFixed;
+            this.broken = false;
+            this.dispersed = false;
+        }
+
+        draw(thick) {
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, thick * 2, 0, Math.PI * 2);
+            if (this.dispersed) {
+                ctx.fillStyle = '#95a5a6'; // 沖散時變灰色
+            } else if (isFlushing && integrity < 80) {
+                ctx.fillStyle = '#f39c12'; // 黃色，表示開始分解
+            } else {
+                ctx.fillStyle = '#e8f5e8'; // 淺綠色原本結構
+            }
+            ctx.fill();
+            if(!this.broken) {
+                ctx.strokeStyle = integrity < 80 && isFlushing ? '#e67e22' : '#27ae60'; // orange for breaking, green for intact
+                ctx.lineWidth = 1;
+                ctx.stroke();
+            }
+        }
+
+        update(flow, shearForce) {
+            if (this.broken) {
+                this.vx += flow * 0.2 + Math.random() * 0.5;
+                this.vy += (Math.random() - 0.5) * 2;
+                this.x += this.vx;
+                this.y += this.vy;
+                // 計算移動距離，超過50像素時視為沖散
+                const dist = Math.sqrt((this.x - this.originX)**2 + (this.y - this.originY)**2);
+                if (dist > 50) {
+                    this.dispersed = true;
+                }
+            } else if (isFlushing) {
+                // 微顫抖效果
+                this.x = this.originX + (Math.random() - 0.5) * shearForce;
+            }
+        }
+    }
+
+    function initPad() {
+        particles = [];
+        integrity = 100;
+        isFlushing = false;
+        const len = document.getElementById('len').value / 2;
+        const thick = document.getElementById('thick').value;
+        const startX = (canvas.width - len) / 2;
+        const startY = canvas.height / 2;
+
+        // 生成矩形網格粒子
+        for (let i = 0; i < len; i += 10) {
+            for (let j = 0; j < thick * 10; j += 8) {
+                particles.push(new Fiber(startX + i, startY - (thick * 5) + j, false));
+            }
+        }
+        draw();
+    }
+
+    function draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        // 繪製水流背景
+        if (isFlushing) {
+            ctx.fillStyle = 'rgba(52, 152, 219, 0.1)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
+
+        const thick = document.getElementById('thick').value;
+        particles.forEach(p => p.draw(thick));
+    }
+
+    function startFlush() {
+        if (isFlushing) return;
+        isFlushing = true;
+        animate();
+    }
+
+    function animate() {
+        const flow = parseFloat(document.getElementById('flow').value);
+        const len = parseFloat(document.getElementById('len').value);
+        const thick = parseFloat(document.getElementById('thick').value);
+        const bond = parseFloat(document.getElementById('bond').value);
+
+        // 核心算式
+        const resistance = thick * bond * 0.8;
+        const shearForce = (Math.pow(flow, 2) * len) / 150;
+        const damageBase = Math.max(0, shearForce - resistance);
+
+        if (damageBase > 0) {
+            integrity -= damageBase * 0.05;
+        }
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        // 繪製水流背景
+        if (isFlushing) {
+            ctx.fillStyle = 'rgba(52, 152, 219, 0.1)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            // 繪製水流線條
+            ctx.strokeStyle = 'rgba(52, 152, 219, 0.3)';
+            ctx.lineWidth = 2;
+            for (let i = 0; i < 10; i++) {
+                ctx.beginPath();
+                ctx.moveTo(0, i * 40);
+                ctx.lineTo(canvas.width, i * 40 + 50);
+                ctx.stroke();
+            }
+        }
+        
+        // 更新與繪製粒子
+        particles.forEach(p => {
+            if (!p.broken && Math.random() * 100 > integrity) {
+                p.broken = true;
+            }
+            p.update(flow, shearForce);
+            p.draw(thick);
+        });
+
+        // 更新數據面板
+        const currentIntegrity = Math.max(0, integrity);
+        stats.innerHTML = `
+            狀態: ${integrity > 0 ? '沖水中...' : '已完全分散'}<br>
+            剪切力 (Shear): ${shearForce.toFixed(2)} N<br>
+            結構阻力 (Resistance): ${resistance.toFixed(2)} N<br>
+            當前結構完整度: ${currentIntegrity.toFixed(1)}%<br>
+            <div class="integrity-bar"><div class="integrity-fill" style="width: ${currentIntegrity}%; background: ${currentIntegrity > 60 ? '#27ae60' : currentIntegrity > 30 ? '#f39c12' : '#e74c3c'};"></div></div>
+        `;
+
+        if (integrity > -50) { // 讓粒子跑一會再停止
+            requestAnimationFrame(animate);
+        } else {
+            isFlushing = false;
+            stats.innerHTML += "<br><strong>結果：模擬完成</strong>";
+        }
+    }
+
+    // 初始化
+    initPad();
+
+    function resetSimulation() {
+        integrity = 100;
+        isFlushing = false;
+        initPad();
+        stats.innerHTML = `
+            狀態: 等待沖水...<br>
+            當前結構完整度: 100%<br>
+            <div class="integrity-bar"><div class="integrity-fill" style="width: 100%; background: #27ae60;"></div></div>
+        `;
+    }
+
+</script>
+
+</body>
+</html>
